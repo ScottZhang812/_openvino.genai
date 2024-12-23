@@ -23,6 +23,7 @@ EmbeddingsModel::EmbeddingsModel(const std::filesystem::path& model_dir,
     ov::Core core = utils::singleton_core();
     std::shared_ptr<ov::Model> m_model = core.read_model((model_dir / "openvino_text_embeddings_model.xml").string());
     // apply embedding postprocessing step by merging them into the model
+    // HARD
     merge_postprocess(m_model, scale_emb);
 
     ov::CompiledModel compiled_model = core.compile_model(m_model, device, properties);
