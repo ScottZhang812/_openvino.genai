@@ -58,9 +58,6 @@ public:
     // position_ids[N, conversation length], beam_idx[N].
     // Output shape: logits[N, conversation length, vocab_size].
     ov::InferRequest m_language;
-    // True if chat mode is activated to save conversation
-    // history between generate() calls.
-    bool m_is_chat_conversation;
     // InputsEmbedder
     std::shared_ptr<InputsEmbedder> m_inputs_embedder;
     // Load pipeline time
@@ -84,8 +81,7 @@ public:
             utils::from_config_json_if_exists<GenerationConfig>(
                 models_dir, "generation_config.json"
             )
-        },
-        m_is_chat_conversation{false} {
+        } {
         m_inputs_embedder = std::make_shared<InputsEmbedder>(
             m_vlm_config, models_dir, device, properties);
 
@@ -125,8 +121,7 @@ public:
                 config_dir_path, "config.json"
             )
         },
-        m_generation_config{generation_config},
-        m_is_chat_conversation{false} {
+        m_generation_config{generation_config} {
         
         m_inputs_embedder = std::make_shared<InputsEmbedder>(
             m_vlm_config, models_map, tokenizer, config_dir_path, device, properties);
@@ -156,108 +151,77 @@ public:
         GenerationConfig generation_config,
         const StreamerVariant& streamer
     ) {
-        auto generate_start_time = std::chrono::steady_clock::now();
-        VLMPerfMetrics perf_metrics;
-        auto& raw_counters = perf_metrics.raw_metrics;
-        auto& raw_vlm_counters = perf_metrics.vlm_raw_metrics;
-        // If eos_token_id was not provided, take value from default m_generation_config
+        // 验证和设置generation_config
         if (generation_config.eos_token_id == -1)
             generation_config.set_eos_token_id(m_generation_config.eos_token_id);
         generation_config.validate();
 
-        auto start_get_inputs_embeds = std::chrono::steady_clock::now();
-        ov::Tensor inputs_embeds = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, perf_metrics);
-        auto end_get_inputs_embeds = std::chrono::steady_clock::now();
+        // 获取输入嵌入
+        ov::genai::VLMPerfMetrics tmpMetrics;
+        ov::Tensor inputs_embeds = m_inputs_embedder->get_inputs_embeds(prompt, rgbs, tmpMetrics);
 
+        // 处理KV缓存
         auto to_remove_from_hist = m_inputs_embedder->get_num_tokens_to_remove_from_hist();
         ov::genai::utils::trim_kv_cache(m_language, to_remove_from_hist, m_kv_cache_seq_length_axis, std::nullopt);
 
+        // 准备序列组
         std::vector<SequenceGroup::Ptr> requests;
         size_t request_id = 0;
         size_t block_size = 1; // not used
         bool enable_prefix_caching = false;
 
+        // 计算历史大小和输入大小
         size_t history_size = m_language.get_tensor("attention_mask").get_shape().at(1) - to_remove_from_hist;
         size_t inputs_embeds_size = inputs_embeds.get_shape().at(1);
 
+        // 准备prompt_ids
         auto tokenized_history = m_inputs_embedder->get_tokenized_history();
         ov::Tensor prompt_ids(ov::element::i64, { history_size + inputs_embeds_size });
         std::fill_n(prompt_ids.data<int64_t>(), prompt_ids.get_size(), m_tokenizer.get_pad_token_id());
         std::copy(tokenized_history.begin(), tokenized_history.end(), prompt_ids.data<int64_t>());
 
-        SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(request_id, prompt_ids, generation_config, block_size, enable_prefix_caching);
+        // 创建序列组
+        SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(
+            request_id, prompt_ids, generation_config, block_size, enable_prefix_caching);
         sequence_group->set_sequence_group_ptr(sequence_group);
         requests.push_back(sequence_group);
 
-        std::shared_ptr<StreamerBase> streamer_ptr = std::visit(overloaded{
-            [&m_tokenizer = m_tokenizer](
-                const std::function<bool(std::string)>& callback
-            ) -> std::shared_ptr<StreamerBase> {
-                return std::make_shared<TextCallbackStreamer>(m_tokenizer, callback);
-            },
-            [](const std::shared_ptr<StreamerBase>& ptr) {
-                return ptr;
-            },
-            [](std::monostate) {
-                return std::shared_ptr<StreamerBase>{nullptr};
-            },
-        }, streamer);
-
-        OPENVINO_ASSERT(streamer_ptr == nullptr || generation_config.num_return_sequences == 1 &&
-            (generation_config.is_greedy_decoding() || generation_config.is_multinomial()),
-            "Currently streaming is possible only with batch size=1 and only for greedy or multinomial decoding");
-
+        // 准备注意力掩码和位置编码
         ov::Tensor new_atten_mask = ov::Tensor{ov::element::i64, { 1, history_size + inputs_embeds_size }};
         std::fill_n(new_atten_mask.data<int64_t>(), new_atten_mask.get_size(), 1);
 
         ov::Tensor position_ids = ov::Tensor{ov::element::i64, { 1, inputs_embeds_size }};
         std::iota(position_ids.data<int64_t>(), position_ids.data<int64_t>() + position_ids.get_size(), history_size);
 
+        // 设置采样器种子
         if (m_sampler.get_seed() != generation_config.rng_seed) {
             m_sampler.set_seed(generation_config.rng_seed);
         }
 
+        // 生成文本
         ov::genai::EncodedResults encoded_result;
         std::optional<int64_t> last_disappeared_token;
-        std::tie(encoded_result, last_disappeared_token) = ov::genai::get_lm_encoded_results(m_language, inputs_embeds, new_atten_mask, streamer_ptr, m_sampler, requests,
-                                                                                             position_ids, m_embedding);
+        std::tie(encoded_result, last_disappeared_token) = ov::genai::get_lm_encoded_results(
+            m_language, inputs_embeds, new_atten_mask, nullptr, m_sampler, requests,
+            position_ids, m_embedding);
 
-        auto decode_start_time = std::chrono::steady_clock::now();
+        // 解码结果
         VLMDecodedResults decoded;
         for (size_t idx = 0; idx < encoded_result.tokens.size(); ++idx) {
             decoded.texts.push_back(m_tokenizer.decode(encoded_result.tokens.at(idx)));
             decoded.scores.push_back(encoded_result.scores.at(idx));
         }
-        auto decode_end_time = std::chrono::steady_clock::now();
 
-        m_inputs_embedder->update_tokenized_history(encoded_result.tokens[0], last_disappeared_token, generation_config.is_beam_search(),
-                                                    m_language.get_tensor("attention_mask").get_shape()[1] - (history_size + inputs_embeds_size));
+        // 更新历史记录
+        m_inputs_embedder->update_tokenized_history(
+            encoded_result.tokens[0], 
+            last_disappeared_token,
+            generation_config.is_beam_search(),
+            m_language.get_tensor("attention_mask").get_shape()[1] - (history_size + inputs_embeds_size));
 
-        std::string decoded_results = decoded.texts.at(0);
-        if (m_is_chat_conversation) {
-            m_inputs_embedder->update_chat_history(decoded_results);
-        } else {
-            m_language.reset_state();
-            m_language.get_tensor("attention_mask").set_shape({1, 0});
-        }
-
-        auto generate_end_time = std::chrono::steady_clock::now();
-        decoded.perf_metrics = encoded_result.perf_metrics;
-
-        // Common perf metrics
-        auto& res_raw_counters = decoded.perf_metrics.raw_metrics;
-        decoded.perf_metrics.num_input_tokens = prompt_ids.get_size();
-        decoded.perf_metrics.load_time = m_load_time_ms;
-        res_raw_counters.generate_durations.emplace_back(PerfMetrics::get_microsec(generate_end_time - generate_start_time));
-        res_raw_counters.detokenization_durations.emplace_back(PerfMetrics::get_microsec(decode_end_time - decode_start_time));
-        res_raw_counters.tokenization_durations.insert(res_raw_counters.tokenization_durations.end(), raw_counters.tokenization_durations.begin(), raw_counters.tokenization_durations.end());
-        
-        // VLM specific perf metrics
-        decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
-
-        // Evaluate statistics
-        decoded.perf_metrics.m_evaluated = false;
-        decoded.perf_metrics.evaluate_statistics(generate_start_time);
+        // 重置状态
+        m_language.reset_state();
+        m_language.get_tensor("attention_mask").set_shape({1, 0});
 
         return decoded;
     }
@@ -290,34 +254,34 @@ public:
         );
     }
 
-    void start_chat(const std::string& system_message) {
-        m_is_chat_conversation = true;
-        bool have_state = 0 != m_language.get_tensor("attention_mask").get_size();
-        if (have_state) {
-            // Resetting state may be slow.
-            m_language.reset_state();
-            // Since if is already introduced, move all resetting here.
-            m_language.get_tensor("attention_mask").set_shape({1, 0});
-        }
-        m_inputs_embedder->start_chat(system_message);
-    }
+    // void start_chat(const std::string& system_message) {
+    //     m_is_chat_conversation = true;
+    //     bool have_state = 0 != m_language.get_tensor("attention_mask").get_size();
+    //     if (have_state) {
+    //         // Resetting state may be slow.
+    //         m_language.reset_state();
+    //         // Since if is already introduced, move all resetting here.
+    //         m_language.get_tensor("attention_mask").set_shape({1, 0});
+    //     }
+    //     m_inputs_embedder->start_chat(system_message);
+    // }
 
-    void finish_chat() {
-        m_is_chat_conversation = false;
-        // Resetting state may be slow.
-        m_language.reset_state();
-        // clear all chat history
-        m_inputs_embedder->finish_chat();
-    }
+    // void finish_chat() {
+    //     m_is_chat_conversation = false;
+    //     // Resetting state may be slow.
+    //     m_language.reset_state();
+    //     // clear all chat history
+    //     m_inputs_embedder->finish_chat();
+    // }
 
     Tokenizer get_tokenizer() const {
         return m_tokenizer;
     }
 
-    void set_chat_template(const std::string& new_template) {
-        OPENVINO_ASSERT(!m_is_chat_conversation, "Chat template cannot be changed once start_chat() is called. Please, finish current chat via finish_chat()");
-        m_tokenizer.set_chat_template(new_template);
-    }
+    // void set_chat_template(const std::string& new_template) {
+    //     OPENVINO_ASSERT(!m_is_chat_conversation, "Chat template cannot be changed once start_chat() is called. Please, finish current chat via finish_chat()");
+    //     m_tokenizer.set_chat_template(new_template);
+    // }
 
     GenerationConfig get_generation_config() const {
         return m_generation_config;
@@ -380,17 +344,17 @@ VLMDecodedResults VLMPipeline::generate(
     return m_pimpl->generate(prompt, config_map);
 }
 
-void VLMPipeline::start_chat(const std::string& system_message) {
-    m_pimpl->start_chat(system_message);
-}
+// void VLMPipeline::start_chat(const std::string& system_message) {
+//     m_pimpl->start_chat(system_message);
+// }
 
-void VLMPipeline::finish_chat() {
-    m_pimpl->finish_chat();
-}
+// void VLMPipeline::finish_chat() {
+//     m_pimpl->finish_chat();
+// }
 
-void VLMPipeline::set_chat_template(const std::string& new_template) {
-    m_pimpl->set_chat_template(new_template);
-}
+// void VLMPipeline::set_chat_template(const std::string& new_template) {
+//     m_pimpl->set_chat_template(new_template);
+// }
 
 Tokenizer VLMPipeline::get_tokenizer() const {
     return m_pimpl->get_tokenizer();
